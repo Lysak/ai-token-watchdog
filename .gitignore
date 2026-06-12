@@ -1,0 +1,8 @@
+.env
+.idea
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+logs/
+ai_token_watchdog.egg-info

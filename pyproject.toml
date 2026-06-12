@@ -1,0 +1,18 @@
+[project]
+name = "ai-token-watchdog"
+version = "0.1.0"
+description = "Monitor AI token usage (Claude, Codex, Perplexity) and send Telegram notifications"
+requires-python = ">=3.14"
+dependencies = [
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+watchdog = "watchdog:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+exclude = ["logs*", "launchd*"]
