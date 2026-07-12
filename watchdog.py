@@ -7,7 +7,6 @@ Usage:
 """
 
 import json
-import math
 import os
 import re
 import subprocess
@@ -20,25 +19,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CODEXBAR = "/opt/homebrew/bin/codexbar"
-BUNX = os.getenv("BUNX_PATH", "/opt/homebrew/bin/bunx")
+CODEXBAR = os.getenv("CODEXBAR_PATH", "/opt/homebrew/bin/codexbar")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
 WORK_START = int(os.getenv("WORK_START_HOUR", "8"))
 WORK_END = int(os.getenv("WORK_END_HOUR", "22"))
 
+RESET_CREDIT_WARN_DAYS = int(os.getenv("RESET_CREDIT_WARN_DAYS", "14"))
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "reset_state.json")
+
 PROVIDER_ICONS = {
     "codex": "🟢",
     "claude": "🟣",
     "perplexity": "🔵",
-}
-
-# Map watchdog provider names → ccusage agent names (None = not tracked by ccusage)
-CCUSAGE_AGENT_MAP: dict[str, str | None] = {
-    "codex": "codex",
-    "claude": "claude",
-    "perplexity": None,
 }
 
 
@@ -62,7 +56,9 @@ def get_usage_data() -> list[dict]:
         text=True,
         timeout=30,
     )
-    if result.returncode != 0:
+    # Exit code 3 means one provider had a partial error but JSON is still emitted.
+    # Only hard-fail when there is no usable stdout output.
+    if result.returncode not in (0, 3) or not result.stdout.strip():
         raise RuntimeError(f"codexbar exited {result.returncode}: {result.stderr.strip()}")
     return json.loads(result.stdout)
 
@@ -71,28 +67,48 @@ def find_provider(data: list[dict], name: str) -> dict | None:
     return next((p for p in data if p.get("provider") == name), None)
 
 
-def get_ccusage_costs(agent: str) -> dict[str, float]:
-    """Return {date_str: cost_usd} for the last ~2 days via ccusage CLI.
+def get_codexbar_costs(provider: str) -> dict:
+    """Return cost data for a provider via `codexbar cost --format json`.
 
-    Returns empty dict if ccusage is unavailable or the agent isn't tracked.
+    Keys: today_cost, yesterday_cost, today_tokens, today_models,
+          last_30d_cost, last_30d_tokens, cache_pct (Claude only).
+    Returns empty dict if unavailable.
     """
     try:
         result = subprocess.run(
-            [BUNX, "ccusage", agent, "daily", "--json"],
+            [CODEXBAR, "cost", "--format", "json", "--provider", provider],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        if result.returncode != 0:
+        if result.returncode != 0 or not result.stdout.strip():
             return {}
-        entries = json.loads(result.stdout).get("daily", [])
-        costs: dict[str, float] = {}
-        for entry in entries:
-            date = entry.get("date") or entry.get("period")
-            cost = entry.get("totalCost") or entry.get("costUSD")
-            if date is not None and cost is not None:
-                costs[date] = float(cost)
-        return costs
+        data = json.loads(result.stdout)
+        if not data:
+            return {}
+        p = data[0]
+        now_tz = datetime.now(TZ)
+        today = now_tz.strftime("%Y-%m-%d")
+        yesterday = (now_tz - timedelta(days=1)).strftime("%Y-%m-%d")
+        daily = p.get("daily", [])
+        today_e = next((d for d in daily if d.get("date") == today), None)
+        yest_e = next((d for d in daily if d.get("date") == yesterday), None)
+
+        out: dict = {
+            "today_cost": today_e.get("totalCost") if today_e else None,
+            "today_tokens": today_e.get("totalTokens") if today_e else None,
+            "today_models": today_e.get("modelsUsed", []) if today_e else [],
+            "yesterday_cost": yest_e.get("totalCost") if yest_e else None,
+            "last_30d_cost": p.get("last30DaysCostUSD"),
+            "last_30d_tokens": p.get("last30DaysTokens"),
+        }
+        # Cache-read ratio for Claude (cache reads dominate cost profile)
+        if today_e:
+            total = today_e.get("totalTokens") or 0
+            cache_r = today_e.get("cacheReadTokens") or 0
+            if total > 0:
+                out["cache_pct"] = cache_r / total * 100
+        return out
     except Exception:
         return {}
 
@@ -123,6 +139,52 @@ def _limit_line(label: str, limit: dict) -> str:
     pct = limit.get("usedPercent")
     reset = limit.get("resetDescription", "?")
     return f"  {label}: {alert_emoji(pct)} {format_bar(pct)}  ↻ {reset}"
+
+
+def _codex_reset_credits_line(usage: dict) -> str | None:
+    """Return a warning line when any Codex reset credit expires within RESET_CREDIT_WARN_DAYS days."""
+    credits_data = usage.get("codexResetCredits")
+    if not credits_data:
+        return None
+
+    now = datetime.now(timezone.utc)
+    warn_cutoff = now + timedelta(days=RESET_CREDIT_WARN_DAYS)
+
+    available = [
+        c for c in credits_data.get("credits", [])
+        if c.get("status") == "available"
+    ]
+    if not available:
+        return None
+
+    expiring_soon = sorted(
+        (
+            (_parse_dt(c.get("expires_at")), c)
+            for c in available
+            if _parse_dt(c.get("expires_at")) is not None
+              and _parse_dt(c.get("expires_at")) <= warn_cutoff
+        ),
+        key=lambda x: x[0],
+    )
+
+    if not expiring_soon:
+        return None
+
+    count = len(available)
+    credit_word = "reset" if count == 1 else "resets"
+    parts = []
+    for expires_dt, _ in expiring_soon:
+        days_left = (expires_dt - now).days
+        date_label = expires_dt.astimezone(TZ).strftime("%b %d")
+        if days_left <= 0:
+            parts.append(f"{date_label} (today!)")
+        elif days_left == 1:
+            parts.append(f"{date_label} (tomorrow)")
+        else:
+            parts.append(f"{date_label} (in {days_left}d)")
+
+    expiry_str = ", ".join(parts)
+    return f"  ⏳ Reset credits: {count} {credit_word} available — expires {expiry_str}"
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +279,12 @@ def build_monitor_message(data: list[dict], enabled: set[str]) -> str:
         title = f"{icon} *{name.capitalize()}{f' ({login})' if login else ''}*"
 
         lines.append(title)
+
+        if provider.get("error"):
+            lines.append("  ⚠️ Auth required — run `codexbar` and sign in")
+            lines.append("")
+            continue
+
         if primary:
             lines.append(_limit_line("5h ", primary))
         if secondary:
@@ -236,6 +304,24 @@ def build_monitor_message(data: list[dict], enabled: set[str]) -> str:
             if advice:
                 lines.append(advice)
 
+        # Codex reset credits expiry warning (shown ≤ RESET_CREDIT_WARN_DAYS before expiry)
+        if name == "codex":
+            credit_line = _codex_reset_credits_line(usage)
+            if credit_line:
+                lines.append(credit_line)
+
+        # Cost summary (codex + claude only — perplexity has no local logs)
+        if name in ("codex", "claude"):
+            costs = get_codexbar_costs(name)
+            if costs:
+                parts = []
+                if costs.get("today_cost") is not None:
+                    parts.append(f"Today: `${costs['today_cost']:.2f}`")
+                if costs.get("last_30d_cost") is not None:
+                    parts.append(f"30d: `${costs['last_30d_cost']:,.0f}`")
+                if parts:
+                    lines.append(f"  💰 {' | '.join(parts)}")
+
         lines.append("")
 
     return "\n".join(lines).rstrip()
@@ -244,11 +330,10 @@ def build_monitor_message(data: list[dict], enabled: set[str]) -> str:
 def build_daily_message(data: list[dict], enabled: set[str]) -> str:
     now_tz = datetime.now(TZ)
     today = now_tz.strftime("%Y-%m-%d")
-    yesterday = (now_tz - timedelta(days=1)).strftime("%Y-%m-%d")
     lines = [f"📊 *Daily Report* — {today}\n"]
 
     total_today = 0.0
-    total_yesterday = 0.0
+    total_30d = 0.0
     has_cost_data = False
 
     for name in ["codex", "claude", "perplexity"]:
@@ -261,56 +346,137 @@ def build_daily_message(data: list[dict], enabled: set[str]) -> str:
         icon = PROVIDER_ICONS.get(name, "⚪")
         usage = provider.get("usage", {})
 
-        # --- Try ccusage first (real dollar costs from local logs) ---
-        ccusage_agent = CCUSAGE_AGENT_MAP.get(name)
-        today_val: float | None = None
-        yesterday_val: float | None = None
-
-        if ccusage_agent:
-            costs = get_ccusage_costs(ccusage_agent)
-            today_val = costs.get(today)
-            yesterday_val = costs.get(yesterday)
-
-        # --- Fallback: CodexBar openaiDashboard breakdown (Codex only) ---
-        if today_val is None:
-            breakdown = (
-                provider.get("openaiDashboard", {}).get("usageBreakdown")
-                or usage.get("usageBreakdown")
-                or []
-            )
-            breakdown_sorted = sorted(breakdown, key=lambda x: x.get("day", ""), reverse=True)
-            cb_today = breakdown_sorted[0].get("totalCreditsUsed") if breakdown_sorted else None
-            cb_yesterday = breakdown_sorted[1].get("totalCreditsUsed") if len(breakdown_sorted) > 1 else None
-            today_val = cb_today
-            yesterday_val = cb_yesterday
-
-        if today_val is not None:
-            total_today += today_val
-            has_cost_data = True
-            source = "ccusage" if ccusage_agent else "API-equiv"
-            lines.append(f"{icon} *{name.capitalize()}* today: `${today_val:.2f}` ({source})")
-            if yesterday_val is not None:
-                total_yesterday += yesterday_val
-        else:
+        if name not in ("codex", "claude"):
+            # Perplexity — no local logs, show usage % only
             primary_pct = usage.get("primary", {}).get("usedPercent")
             weekly_pct = usage.get("secondary", {}).get("usedPercent")
-            pct_info = ""
-            if primary_pct is not None:
-                pct_info = f"  5h: {primary_pct}%"
-            if weekly_pct is not None:
-                pct_info += f"  7d: {weekly_pct}%"
-            lines.append(f"{icon} *{name.capitalize()}*: subscription plan (no cost data){pct_info}")
+            pct = f"  5h: {primary_pct}%  7d: {weekly_pct}%" if primary_pct is not None else ""
+            lines.append(f"{icon} *{name.capitalize()}*: subscription — no cost data{pct}")
+            lines.append("")
+            continue
 
-    lines.append("")
+        costs = get_codexbar_costs(name)
+        today_cost = costs.get("today_cost")
+        yest_cost = costs.get("yesterday_cost")
+        last_30d = costs.get("last_30d_cost")
+        last_30d_tok = costs.get("last_30d_tokens")
+        models = costs.get("today_models", [])
+        cache_pct = costs.get("cache_pct")
+
+        login = usage.get("loginMethod") or provider.get("openaiDashboard", {}).get("accountPlan", "")
+        lines.append(f"{icon} *{name.capitalize()}{f' ({login})' if login else ''}*")
+
+        if today_cost is not None:
+            model_str = f"  _{', '.join(models)}_" if models else ""
+            lines.append(f"  Today: `${today_cost:.2f}`{model_str}")
+            total_today += today_cost
+            has_cost_data = True
+        else:
+            lines.append("  Today: no data yet")
+
+        if yest_cost is not None:
+            lines.append(f"  Yesterday: `${yest_cost:.2f}`")
+
+        if last_30d is not None:
+            tok_str = f"  ({last_30d_tok / 1e9:.2f}B tokens)" if last_30d_tok else ""
+            lines.append(f"  30d: `${last_30d:,.0f}`{tok_str}")
+            total_30d += last_30d
+
+        if cache_pct is not None and name == "claude":
+            lines.append(f"  Cache reads: {cache_pct:.0f}% of tokens")
+
+        lines.append("")
+
     if has_cost_data:
         lines.append(f"💰 *Total today:* `${total_today:.2f}`")
-        if total_yesterday > 0:
-            lines.append(f"📅 Yesterday: `${total_yesterday:.2f}`")
-        lines.append("_Costs are API-equivalent — actual charge is your flat subscription fee._")
-    else:
-        lines.append("_All active providers are subscription plans — no per-token cost data available._")
+        if total_30d > 0:
+            lines.append(f"📅 *30d API-equiv:* `${total_30d:,.0f}`")
+    lines.append("_API-equivalent costs — actual charge is your flat subscription fee._")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Reset detection
+# ---------------------------------------------------------------------------
+
+def load_reset_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_reset_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def detect_resets(
+    data: list[dict], enabled: set[str], old_state: dict
+) -> tuple[list[tuple[str, str, dict, dict]], dict]:
+    """Detect weekly (7d) limit resets for Codex and Claude.
+
+    A reset is any decrease in the secondary window's usedPercent — weekly usage
+    can only go up, so any drop unambiguously means the provider reset the quota.
+    Returns (resets, new_state).
+    """
+    resets: list[tuple[str, str, dict, dict]] = []
+    new_state: dict = {}
+
+    for name in ["codex", "claude"]:
+        if name not in enabled:
+            continue
+        provider = find_provider(data, name)
+        if not provider:
+            continue
+
+        window = provider.get("usage", {}).get("secondary")
+        if not window:
+            continue
+
+        new_pct = window.get("usedPercent")
+        new_state[name] = {"usedPercent": new_pct}
+
+        old_pct = old_state.get(name, {}).get("usedPercent")
+        if old_pct is not None and new_pct is not None and new_pct < old_pct:
+            resets.append((name, "secondary", {"usedPercent": old_pct}, window))
+
+    return resets, new_state
+
+
+def build_reset_message(resets: list[tuple[str, str, dict, dict]]) -> str:
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    lines = [f"🔄 *Limit Reset!* — {now}\n"]
+
+    for name, _window_key, old_window, new_window in resets:
+        icon = PROVIDER_ICONS.get(name, "⚪")
+        old_pct = old_window.get("usedPercent", "?")
+        new_pct = new_window.get("usedPercent", "?")
+        reset_desc = new_window.get("resetDescription", "")
+
+        lines.append(f"{icon} *{name.capitalize()}* — weekly (7d) limit reset")
+        lines.append(f"  Was: {old_pct}% used → Now: {new_pct}% used")
+        if reset_desc:
+            lines.append(f"  Next reset: {reset_desc}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def check_resets(data: list[dict], enabled: set[str]) -> None:
+    old_state = load_reset_state()
+    resets, new_state = detect_resets(data, enabled, old_state)
+    save_reset_state(new_state)
+
+    ts = datetime.now(TZ).strftime("%H:%M:%S")
+    if resets:
+        send_telegram(build_reset_message(resets))
+        print(f"[{ts}] Sent reset notification ({len(resets)} reset(s)).")
+    else:
+        print(f"[{ts}] No resets detected.")
 
 
 # ---------------------------------------------------------------------------
@@ -337,12 +503,18 @@ def main() -> None:
         sys.exit(1)
 
     daily = "--daily" in sys.argv
+    reset_check = "--reset-check" in sys.argv
 
     try:
         data = get_usage_data()
         enabled = get_enabled_providers()
         if not enabled:
             print("WARNING: No providers enabled. Set PROVIDER_*_ENABLED=true in .env", file=sys.stderr)
+
+        if reset_check:
+            check_resets(data, enabled)
+            return
+
         message = build_daily_message(data, enabled) if daily else build_monitor_message(data, enabled)
     except FileNotFoundError:
         message = f"🚨 *AI Token Watchdog ERROR*\ncodexbar not found at `{CODEXBAR}`"

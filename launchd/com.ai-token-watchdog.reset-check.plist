@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ai-token-watchdog.reset-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV_PATH__</string>
+        <string>run</string>
+        <string>__WATCHDOG_PATH__</string>
+        <string>--reset-check</string>
+    </array>
+
+    <!-- Runs every 30 minutes (1800 seconds) -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/reset-check.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/reset-check.error.log</string>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Run at load to establish initial state baseline -->
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

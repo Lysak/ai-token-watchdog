@@ -17,6 +17,7 @@ WATCHDOG_PATH="$PROJECT_DIR/watchdog.py"
 PLISTS=(
     "com.ai-token-watchdog.monitor.plist"
     "com.ai-token-watchdog.daily.plist"
+    "com.ai-token-watchdog.reset-check.plist"
 )
 
 if [[ -z "$UV_PATH" ]]; then
@@ -104,6 +105,7 @@ d
 }" \
         -e "s|__DAILY_REPORT_HOUR__|$DAILY_REPORT_HOUR|g" \
         "$src" > "$target" <<< "$MONITOR_HOURS_XML"
+    # reset-check plist has no placeholders beyond the common ones — sed above handles it
 
     launchctl load "$target"
     echo "Loaded: $plist"
@@ -113,6 +115,7 @@ echo ""
 echo "Agents installed successfully."
 echo "  Monitor runs at local hours: ${MONITOR_HOURS}."
 echo "  Daily report runs at ${DAILY_REPORT_HOUR}:00."
+echo "  Reset-check runs every 30 min (state saved to logs/reset_state.json)."
 echo ""
 echo "Verify:  launchctl list | grep watchdog"
 echo "Logs in: $PROJECT_DIR/logs/"
