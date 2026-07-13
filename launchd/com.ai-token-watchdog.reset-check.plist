@@ -13,9 +13,9 @@
         <string>--reset-check</string>
     </array>
 
-    <!-- Runs every 30 minutes (1800 seconds) -->
+    <!-- Runs every 10 minutes (600 seconds) -->
     <key>StartInterval</key>
-    <integer>1800</integer>
+    <integer>600</integer>
 
     <key>WorkingDirectory</key>
     <string>__PROJECT_DIR__</string>

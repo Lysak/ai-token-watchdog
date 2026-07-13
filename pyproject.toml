@@ -14,5 +14,5 @@ watchdog = "watchdog:main"
 [tool.uv]
 package = true
 
-[tool.setuptools.packages.find]
-exclude = ["logs*", "launchd*"]
+[tool.setuptools]
+py-modules = ["watchdog"]

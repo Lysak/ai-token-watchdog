@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -28,6 +29,8 @@ WORK_END = int(os.getenv("WORK_END_HOUR", "22"))
 
 RESET_CREDIT_WARN_DAYS = int(os.getenv("RESET_CREDIT_WARN_DAYS", "14"))
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "reset_state.json")
+SENT_LOG = Path(os.path.dirname(os.path.abspath(__file__))) / "logs" / "sent.log"
+RESET_COOLDOWN_HOURS = int(os.getenv("RESET_COOLDOWN_HOURS", "2"))
 
 PROVIDER_ICONS = {
     "codex": "🟢",
@@ -421,10 +424,12 @@ def detect_resets(
 
     A reset is any decrease in the secondary window's usedPercent — weekly usage
     can only go up, so any drop unambiguously means the provider reset the quota.
+    Includes a cooldown so a single reset event doesn't produce duplicate alerts.
     Returns (resets, new_state).
     """
     resets: list[tuple[str, str, dict, dict]] = []
     new_state: dict = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for name in ["codex", "claude"]:
         if name not in enabled:
@@ -438,11 +443,25 @@ def detect_resets(
             continue
 
         new_pct = window.get("usedPercent")
-        new_state[name] = {"usedPercent": new_pct}
+        prev = old_state.get(name, {})
+        new_state[name] = {"usedPercent": new_pct, "lastNotifiedAt": prev.get("lastNotifiedAt")}
 
-        old_pct = old_state.get(name, {}).get("usedPercent")
+        old_pct = prev.get("usedPercent")
         if old_pct is not None and new_pct is not None and new_pct < old_pct:
+            # Cooldown: skip if we already sent a reset alert for this provider recently
+            last_notified = prev.get("lastNotifiedAt")
+            if last_notified:
+                last_dt = datetime.fromisoformat(last_notified)
+                elapsed_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+                if elapsed_h < RESET_COOLDOWN_HOURS:
+                    print(
+                        f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"{name}: reset detected but cooldown active "
+                        f"({elapsed_h:.1f}h < {RESET_COOLDOWN_HOURS}h) — skipping."
+                    )
+                    continue
             resets.append((name, "secondary", {"usedPercent": old_pct}, window))
+            new_state[name]["lastNotifiedAt"] = now_iso
 
     return resets, new_state
 
@@ -469,21 +488,42 @@ def build_reset_message(resets: list[tuple[str, str, dict, dict]]) -> str:
 def check_resets(data: list[dict], enabled: set[str]) -> None:
     old_state = load_reset_state()
     resets, new_state = detect_resets(data, enabled, old_state)
-    save_reset_state(new_state)
 
-    ts = datetime.now(TZ).strftime("%H:%M:%S")
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     if resets:
-        send_telegram(build_reset_message(resets))
-        print(f"[{ts}] Sent reset notification ({len(resets)} reset(s)).")
+        msg = build_reset_message(resets)
+        # Save state AFTER successful send so a Telegram failure allows retry next run.
+        send_telegram(msg, mode="reset")
+        save_reset_state(new_state)
+        names = ", ".join(name for name, *_ in resets)
+        print(f"[{ts}] Sent reset notification ({len(resets)} reset(s): {names}).")
     else:
+        save_reset_state(new_state)
         print(f"[{ts}] No resets detected.")
+
+
+# ---------------------------------------------------------------------------
+# Sent-message log
+# ---------------------------------------------------------------------------
+
+def log_sent(mode: str, text: str) -> None:
+    """Append a one-line entry to sent.log so every outgoing message is auditable."""
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    first_line = text.split("\n")[0].replace("*", "").replace("`", "").strip()
+    entry = f"[{ts}] [{mode}] {first_line}\n"
+    try:
+        SENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with SENT_LOG.open("a") as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"Warning: could not write sent.log: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, mode: str = "message") -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = requests.post(
         url,
@@ -491,6 +531,7 @@ def send_telegram(text: str) -> None:
         timeout=15,
     )
     resp.raise_for_status()
+    log_sent(mode, text)
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +563,9 @@ def main() -> None:
         message = f"🚨 *AI Token Watchdog ERROR*\n`{type(e).__name__}: {e}`"
 
     try:
-        send_telegram(message)
-        mode = "daily report" if daily else "monitor"
-        print(f"[{datetime.now(TZ).strftime('%H:%M:%S')}] Sent {mode} to Telegram.")
+        mode = "daily" if daily else "monitor"
+        send_telegram(message, mode=mode)
+        print(f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}] Sent {mode} to Telegram.")
     except Exception as e:
         print(f"Failed to send Telegram message: {e}", file=sys.stderr)
         sys.exit(1)
