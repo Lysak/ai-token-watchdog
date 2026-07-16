@@ -431,8 +431,14 @@ def detect_resets(
 ) -> tuple[list[tuple[str, str, dict, dict]], dict]:
     """Detect weekly (7d) limit resets for Codex and Claude.
 
-    A reset is any decrease in the secondary window's usedPercent — weekly usage
-    can only go up, so any drop unambiguously means the provider reset the quota.
+    Reset signals differ by provider:
+    - Codex: resetsAt advances to a new date when a new cycle starts.
+    - Claude: resetsAt stays the same; only usedPercent drops (e.g. 5% → 0%).
+
+    To catch Claude resets reliably, we track maxUsedPercent (high-water mark)
+    across runs so a post-reset state of 0% doesn't erase the pre-reset peak.
+    A reset is detected when current usedPercent < maxUsedPercent.
+
     Includes a cooldown so a single reset event doesn't produce duplicate alerts.
     Returns (resets, new_state).
     """
@@ -452,25 +458,51 @@ def detect_resets(
             continue
 
         new_pct = window.get("usedPercent")
+        new_resets_at = window.get("resetsAt")
         prev = old_state.get(name, {})
-        new_state[name] = {"usedPercent": new_pct, "lastNotifiedAt": prev.get("lastNotifiedAt")}
+        old_max_pct = prev.get("maxUsedPercent") or prev.get("usedPercent") or 0
+        new_max_pct = max(new_pct or 0, old_max_pct)
 
-        old_pct = prev.get("usedPercent")
-        if old_pct is not None and new_pct is not None and new_pct < old_pct:
-            # Cooldown: skip if we already sent a reset alert for this provider recently
-            last_notified = prev.get("lastNotifiedAt")
-            if last_notified:
-                last_dt = datetime.fromisoformat(last_notified)
-                elapsed_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
-                if elapsed_h < RESET_COOLDOWN_HOURS:
-                    print(
-                        f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}] "
-                        f"{name}: reset detected but cooldown active "
-                        f"({elapsed_h:.1f}h < {RESET_COOLDOWN_HOURS}h) — skipping."
-                    )
-                    continue
-            resets.append((name, "secondary", {"usedPercent": old_pct}, window))
-            new_state[name]["lastNotifiedAt"] = now_iso
+        new_state[name] = {
+            "usedPercent": new_pct,
+            "maxUsedPercent": new_max_pct,
+            "resetsAt": new_resets_at,
+            "lastNotifiedAt": prev.get("lastNotifiedAt"),
+        }
+
+        old_resets_at = prev.get("resetsAt")
+
+        # Signal 1: usedPercent dropped below the high-water mark (works for both providers)
+        pct_reset = new_pct is not None and new_pct < old_max_pct
+
+        # Signal 2: resetsAt advanced to a new date (Codex only — Claude's resetsAt never changes)
+        cycle_reset = False
+        if name == "codex" and old_resets_at and new_resets_at and old_resets_at != new_resets_at:
+            old_dt = _parse_dt(old_resets_at)
+            new_dt = _parse_dt(new_resets_at)
+            if old_dt and new_dt and new_dt > old_dt:
+                cycle_reset = True
+
+        if not pct_reset and not cycle_reset:
+            continue
+
+        reason = "usedPercent drop" if pct_reset else "resetsAt advanced"
+        last_notified = prev.get("lastNotifiedAt")
+        if last_notified:
+            last_dt = datetime.fromisoformat(last_notified)
+            elapsed_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+            if elapsed_h < RESET_COOLDOWN_HOURS:
+                print(
+                    f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"{name}: reset detected ({reason}) but cooldown active "
+                    f"({elapsed_h:.1f}h < {RESET_COOLDOWN_HOURS}h) — skipping."
+                )
+                continue
+
+        resets.append((name, "secondary", {"usedPercent": old_max_pct}, window))
+        new_state[name]["lastNotifiedAt"] = now_iso
+        # Reset the high-water mark so the next cycle starts fresh
+        new_state[name]["maxUsedPercent"] = new_pct or 0
 
     return resets, new_state
 
