@@ -431,13 +431,12 @@ def detect_resets(
 ) -> tuple[list[tuple[str, str, dict, dict]], dict]:
     """Detect weekly (7d) limit resets for Codex and Claude.
 
-    Reset signals differ by provider:
-    - Codex: resetsAt advances to a new date when a new cycle starts.
-    - Claude: resetsAt stays the same; only usedPercent drops (e.g. 5% → 0%).
+    A reset/recalculation is detected only when usedPercent drops below the
+    prior high-water mark for that provider.
 
-    To catch Claude resets reliably, we track maxUsedPercent (high-water mark)
-    across runs so a post-reset state of 0% doesn't erase the pre-reset peak.
-    A reset is detected when current usedPercent < maxUsedPercent.
+    This intentionally ignores resetsAt drift for Codex. In practice, CodexBar
+    can move that timestamp forward even when usage is unchanged, which creates
+    false weekly reset notifications like 0% -> 0% or 8% -> 8%.
 
     Includes a cooldown so a single reset event doesn't produce duplicate alerts.
     Returns (resets, new_state).
@@ -470,23 +469,13 @@ def detect_resets(
             "lastNotifiedAt": prev.get("lastNotifiedAt"),
         }
 
-        old_resets_at = prev.get("resetsAt")
-
-        # Signal 1: usedPercent dropped below the high-water mark (works for both providers)
+        # Signal: usedPercent dropped below the high-water mark
         pct_reset = new_pct is not None and new_pct < old_max_pct
 
-        # Signal 2: resetsAt advanced to a new date (Codex only — Claude's resetsAt never changes)
-        cycle_reset = False
-        if name == "codex" and old_resets_at and new_resets_at and old_resets_at != new_resets_at:
-            old_dt = _parse_dt(old_resets_at)
-            new_dt = _parse_dt(new_resets_at)
-            if old_dt and new_dt and new_dt > old_dt:
-                cycle_reset = True
-
-        if not pct_reset and not cycle_reset:
+        if not pct_reset:
             continue
 
-        reason = "usedPercent drop" if pct_reset else "resetsAt advanced"
+        reason = "usedPercent drop"
         last_notified = prev.get("lastNotifiedAt")
         if last_notified:
             last_dt = datetime.fromisoformat(last_notified)
