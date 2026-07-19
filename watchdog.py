@@ -68,11 +68,12 @@ def get_usage_data() -> list[dict]:
         text=True,
         timeout=30,
     )
-    # Exit code 3 means one provider had a partial error but JSON is still emitted.
-    # Only hard-fail when there is no usable stdout output.
-    if result.returncode not in (0, 3) or not result.stdout.strip():
-        raise RuntimeError(f"codexbar exited {result.returncode}: {result.stderr.strip()}")
-    return json.loads(result.stdout)
+    stdout = result.stdout.strip()
+    if stdout:
+        return json.loads(stdout)
+
+    detail = result.stderr.strip() or "no stdout or stderr output"
+    raise RuntimeError(f"codexbar exited {result.returncode}: {detail}")
 
 
 def find_provider(data: list[dict], name: str) -> dict | None:
