@@ -51,6 +51,16 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _format_timestamp(value: str | datetime | None) -> str:
+    dt = value if isinstance(value, datetime) else _parse_dt(value)
+    if dt is None:
+        return "?"
+
+    local_dt = dt.astimezone(TZ)
+    timestamp = f"{local_dt.strftime('%b %d, %Y at %H:%M:%S')} ({TZ.key})"
+    return f"{timestamp} (today!)" if local_dt.date() == datetime.now(TZ).date() else timestamp
+
+
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
@@ -218,7 +228,7 @@ def format_bar(pct: int | float | None) -> str:
 
 def _limit_line(label: str, limit: dict) -> str:
     pct = limit.get("usedPercent")
-    reset = limit.get("resetDescription", "?")
+    reset = _format_timestamp(limit.get("resetsAt"))
     return f"  {label}: {alert_emoji(pct)} {format_bar(pct)}  ↻ {reset}"
 
 
@@ -256,9 +266,9 @@ def _codex_reset_credits_line(usage: dict) -> str | None:
     parts = []
     for expires_dt, _ in expiring_soon:
         days_left = (expires_dt - now).days
-        date_label = expires_dt.astimezone(TZ).strftime("%b %d")
+        date_label = _format_timestamp(expires_dt)
         if days_left <= 0:
-            parts.append(f"{date_label} (today!)")
+            parts.append(date_label)
         elif days_left == 1:
             parts.append(f"{date_label} (tomorrow)")
         else:
@@ -573,12 +583,12 @@ def build_reset_message(resets: list[tuple[str, str, dict, dict]]) -> str:
         icon = PROVIDER_ICONS.get(name, "⚪")
         old_pct = old_window.get("usedPercent", "?")
         new_pct = new_window.get("usedPercent", "?")
-        reset_desc = new_window.get("resetDescription", "")
+        reset_at = _format_timestamp(new_window.get("resetsAt"))
 
         lines.append(f"{icon} *{name.capitalize()}* — weekly (7d) limit reset")
         lines.append(f"  Was: {old_pct}% used → Now: {new_pct}% used")
-        if reset_desc:
-            lines.append(f"  Next reset: {reset_desc}")
+        if reset_at != "?":
+            lines.append(f"  Next reset: {reset_at}")
         lines.append("")
 
     return "\n".join(lines).rstrip()
