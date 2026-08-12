@@ -56,13 +56,12 @@ uv run watchdog.py --daily   # daily report message
 bash launchd/install.sh
 ```
 
-This reads `MONITOR_HOURS`, `DAILY_REPORT_HOUR` from your `.env` and installs three launchd agents to `~/Library/LaunchAgents/`:
+This reads `MONITOR_HOURS`, `DAILY_REPORT_HOUR` from your `.env` and installs two launchd agents to `~/Library/LaunchAgents/`:
 
 | Agent | Schedule |
 |---|---|
 | `com.ai-token-watchdog.monitor` | Daily at each hour listed in `MONITOR_HOURS` |
 | `com.ai-token-watchdog.daily` | Daily at `DAILY_REPORT_HOUR:00` |
-| `com.ai-token-watchdog.reset-check` | Every 30 minutes (limit reset detector) |
 
 ```bash
 # Verify agents are running
@@ -71,7 +70,6 @@ launchctl list | grep watchdog
 # View logs
 tail -f logs/monitor.log
 tail -f logs/daily.log
-tail -f logs/reset-check.log
 
 # Uninstall
 bash launchd/install.sh --uninstall
@@ -156,6 +154,8 @@ For each provider, the script calculates:
   💰 Today: $3.18 | 30d: $584
 ```
 
+`↻` is the next limit-reset time reported by CodexBar for that window.
+
 **Daily report (18:00):**
 ```
 📊 Daily Report — 2026-07-12
@@ -174,15 +174,6 @@ For each provider, the script calculates:
 💰 Total today: $11.53
 📅 30d API-equiv: $900
 API-equivalent costs — actual charge is your flat subscription fee.
-```
-
-**Limit reset notification (every 30 min check):**
-```
-🔄 Limit Reset! — 2026-07-12 15:09
-
-🟢 Codex — 5h window reset
-  Was: 100% used → Now: 3% used
-  Next reset: 8:09 PM
 ```
 
 > **About cost data:** All dollar costs come from `codexbar cost`, which reads local CLI logs and calculates API-equivalent spend. Perplexity is a flat subscription with no per-token data — usage % is shown instead.

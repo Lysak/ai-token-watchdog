@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -30,7 +31,9 @@ WORK_END = int(os.getenv("WORK_END_HOUR", "22"))
 RESET_CREDIT_WARN_DAYS = int(os.getenv("RESET_CREDIT_WARN_DAYS", "14"))
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "reset_state.json")
 SENT_LOG = Path(os.path.dirname(os.path.abspath(__file__))) / "logs" / "sent.log"
+CODEXBAR_CALL_LOG = Path(os.path.dirname(os.path.abspath(__file__))) / "logs" / "codexbar-calls.jsonl"
 RESET_COOLDOWN_HOURS = int(os.getenv("RESET_COOLDOWN_HOURS", "2"))
+ERROR_COOLDOWN_HOURS = int(os.getenv("ERROR_COOLDOWN_HOURS", "1"))
 
 PROVIDER_ICONS = {
     "codex": "🟢",
@@ -61,7 +64,55 @@ def get_enabled_providers() -> set[str]:
     return enabled
 
 
+def log_codexbar_call(duration_ms: int, returncode: int, providers: dict, call_error: str | None = None) -> None:
+    """Append one JSON line per `codexbar usage` call, so error frequency/timing can be
+    analyzed later (e.g. `jq 'select(.providers.claude.status=="error")' logs/codexbar-calls.jsonl`)."""
+    entry = {
+        "ts": datetime.now(TZ).isoformat(),
+        "duration_ms": duration_ms,
+        "returncode": returncode,
+        "providers": providers,
+    }
+    if call_error:
+        entry["call_error"] = call_error
+    try:
+        CODEXBAR_CALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with CODEXBAR_CALL_LOG.open("a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Warning: could not write codexbar-calls.jsonl: {e}", file=sys.stderr)
+
+
+def _refetch_claude_via_web(data: list[dict]) -> list[dict]:
+    """Re-fetch the 'claude' entry via `--source web`, which reads claude.ai
+    directly through a cookie cache independent of CodexBar's internal OAuth
+    Keychain cache (com.steipete.codexbar.cache/oauth.claude). That cache has
+    a known upstream bug where it goes stale independently of the live
+    "Claude Code-credentials" item — see docs/codexbar-keychain.md — and
+    "auto" source selection keeps picking it anyway. Falls back to the
+    original (oauth-sourced) entry if the web fetch itself fails or errors,
+    so a genuine outage still surfaces rather than being silently hidden.
+    """
+    try:
+        result = subprocess.run(
+            [CODEXBAR, "usage", "--provider", "claude", "--source", "web", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        web_data = json.loads(result.stdout.strip() or "[]")
+        claude_entry = next((p for p in web_data if p.get("provider") == "claude"), None)
+    except Exception:
+        return data
+
+    if claude_entry is None or claude_entry.get("error"):
+        return data
+
+    return [claude_entry if p.get("provider") == "claude" else p for p in data]
+
+
 def get_usage_data() -> list[dict]:
+    start = time.monotonic()
     result = subprocess.run(
         [CODEXBAR, "usage", "--format", "json"],
         capture_output=True,
@@ -70,9 +121,26 @@ def get_usage_data() -> list[dict]:
     )
     stdout = result.stdout.strip()
     if stdout:
-        return json.loads(stdout)
+        data = json.loads(stdout)
+        if find_provider(data, "claude") is not None:
+            data = _refetch_claude_via_web(data)
 
+        duration_ms = round((time.monotonic() - start) * 1000)
+        providers = {}
+        for p in data:
+            name = p.get("provider", "unknown")
+            err = p.get("error")
+            providers[name] = (
+                {"status": "error", "message": err.get("message"), "code": err.get("code")}
+                if err
+                else {"status": "ok"}
+            )
+        log_codexbar_call(duration_ms, result.returncode, providers)
+        return data
+
+    duration_ms = round((time.monotonic() - start) * 1000)
     detail = result.stderr.strip() or "no stdout or stderr output"
+    log_codexbar_call(duration_ms, result.returncode, {}, call_error=detail)
     raise RuntimeError(f"codexbar exited {result.returncode}: {detail}")
 
 
@@ -516,21 +584,108 @@ def build_reset_message(resets: list[tuple[str, str, dict, dict]]) -> str:
     return "\n".join(lines).rstrip()
 
 
+AUTH_ERROR_HINT = (
+    "This usually means CodexBar's own Keychain cache went stale — "
+    "open the CodexBar menu-bar app and click Refresh once (no macOS "
+    "password needed, just an Allow-access confirmation)."
+)
+
+
+def detect_auth_errors(
+    data: list[dict], enabled: set[str], old_state: dict
+) -> tuple[list[tuple[str, str]], dict]:
+    """Detect provider auth/credential errors, edge-triggered on the transition
+    into the error state — so a single incident alerts once, not on every
+    10-minute --reset-check run for as long as it persists. Recovery (error
+    clears) resets the flag so the *next* incident alerts again.
+
+    Returns (newly_erroring, state_updates):
+      - newly_erroring: (provider_name, error_message) pairs that just started erroring.
+      - state_updates: per-provider {"authErrorActive": bool} to merge into the state file.
+    """
+    newly_erroring: list[tuple[str, str]] = []
+    state_updates: dict = {}
+
+    for name in enabled:
+        provider = find_provider(data, name)
+        if not provider:
+            continue
+        err = provider.get("error")
+        prev_active = old_state.get(name, {}).get("authErrorActive", False)
+
+        if err:
+            if not prev_active:
+                newly_erroring.append((name, err.get("message") or "unknown error"))
+            state_updates[name] = {"authErrorActive": True}
+        elif prev_active:
+            state_updates[name] = {"authErrorActive": False}
+
+    return newly_erroring, state_updates
+
+
+def build_auth_error_message(newly_erroring: list[tuple[str, str]]) -> str:
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    lines = [f"🔑 *Auth error* — {now}\n"]
+    for name, message in newly_erroring:
+        icon = PROVIDER_ICONS.get(name, "⚪")
+        lines.append(f"{icon} *{name.capitalize()}*: {message}")
+    lines.append("")
+    lines.append(AUTH_ERROR_HINT)
+    return "\n".join(lines)
+
+
 def check_resets(data: list[dict], enabled: set[str]) -> None:
+    # Legacy: retained for a possible future opt-in reset detector. The
+    # 10-minute --reset-check launchd job was disabled to avoid frequent
+    # CodexBar calls that can trigger a macOS password prompt.
     old_state = load_reset_state()
-    resets, new_state = detect_resets(data, enabled, old_state)
+    resets, reset_state_updates = detect_resets(data, enabled, old_state)
+    newly_erroring, auth_state_updates = detect_auth_errors(data, enabled, old_state)
+
+    # Merge rather than replace so unrelated top-level keys (e.g. "_error"
+    # cooldown tracking) survive a state save triggered by this function.
+    merged_state = {**old_state, **reset_state_updates}
+    for name, updates in auth_state_updates.items():
+        merged_state[name] = {**merged_state.get(name, {}), **updates}
 
     ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Save state AFTER successful sends so a Telegram failure allows retry next run.
     if resets:
-        msg = build_reset_message(resets)
-        # Save state AFTER successful send so a Telegram failure allows retry next run.
-        send_telegram(msg, mode="reset")
-        save_reset_state(new_state)
+        send_telegram(build_reset_message(resets), mode="reset")
         names = ", ".join(name for name, *_ in resets)
         print(f"[{ts}] Sent reset notification ({len(resets)} reset(s): {names}).")
-    else:
-        save_reset_state(new_state)
+
+    if newly_erroring:
+        send_telegram(build_auth_error_message(newly_erroring), mode="auth-error")
+        names = ", ".join(name for name, _ in newly_erroring)
+        print(f"[{ts}] Sent auth-error notification ({names}).")
+
+    if not resets and not newly_erroring:
         print(f"[{ts}] No resets detected.")
+
+    save_reset_state(merged_state)
+
+
+# ---------------------------------------------------------------------------
+# Error notification cooldown
+# ---------------------------------------------------------------------------
+
+def should_notify_error(state: dict) -> bool:
+    """Return True if enough time passed since the last error alert (or none was sent)."""
+    last_notified = state.get("_error", {}).get("lastNotifiedAt")
+    last_dt = _parse_dt(last_notified)
+    if last_dt is None:
+        return True
+    elapsed_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+    return elapsed_h >= ERROR_COOLDOWN_HOURS
+
+
+def clear_error_cooldown() -> None:
+    """Drop the error cooldown marker once a run succeeds, so the next failure alerts immediately."""
+    state = load_reset_state()
+    if state.pop("_error", None) is not None:
+        save_reset_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -575,31 +730,48 @@ def main() -> None:
         sys.exit(1)
 
     daily = "--daily" in sys.argv
-    reset_check = "--reset-check" in sys.argv
+    # Legacy: --reset-check is intentionally ignored. It used to trigger a
+    # separate 10-minute CodexBar call; all active runs are monitor or daily.
+    mode = "daily" if daily else "monitor"
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         data = get_usage_data()
+        clear_error_cooldown()
         enabled = get_enabled_providers()
         if not enabled:
             print("WARNING: No providers enabled. Set PROVIDER_*_ENABLED=true in .env", file=sys.stderr)
-
-        if reset_check:
-            check_resets(data, enabled)
-            return
 
         message = build_daily_message(data, enabled) if daily else build_monitor_message(data, enabled)
     except FileNotFoundError:
         message = f"🚨 *AI Token Watchdog ERROR*\ncodexbar not found at `{CODEXBAR}`"
     except Exception as e:
         message = f"🚨 *AI Token Watchdog ERROR*\n`{type(e).__name__}: {e}`"
+    else:
+        try:
+            send_telegram(message, mode=mode)
+            print(f"[{ts}] Sent {mode} to Telegram.")
+        except Exception as e:
+            print(f"Failed to send Telegram message: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Error path (get_usage_data / message building failed) — cooldown so a
+    # recurring failure (e.g. codexbar hanging) alerts once, not every run.
+    state = load_reset_state()
+    if not should_notify_error(state):
+        print(f"[{ts}] {message} (suppressed — error cooldown active)", file=sys.stderr)
+        return
 
     try:
-        mode = "daily" if daily else "monitor"
         send_telegram(message, mode=mode)
-        print(f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}] Sent {mode} to Telegram.")
+        print(f"[{ts}] Sent {mode} error to Telegram.")
     except Exception as e:
         print(f"Failed to send Telegram message: {e}", file=sys.stderr)
         sys.exit(1)
+
+    state["_error"] = {"lastNotifiedAt": datetime.now(timezone.utc).isoformat()}
+    save_reset_state(state)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,12 @@
 - macOS launchd for scheduling (not cron)
 - Providers auto-discovered via `PROVIDER_{NAME}_ENABLED=true` env vars
 
-## Reset detection behavior by provider
+## Legacy reset detection (disabled)
+
+The reset-check launchd agent and `--reset-check` path are retained only as
+commented legacy code. They must not be installed or scheduled: frequent
+CodexBar calls can trigger a macOS Keychain password prompt. Active monitor
+messages already show each limit window's next reset time via `↻`.
 
 ### Codex — weekly limit reset
 
@@ -34,3 +39,10 @@ Fields per provider:
 - `maxUsedPercent` — peak usage % seen in the current cycle (Claude reset detection)
 - `resetsAt` — last seen reset timestamp (used for Codex cycle detection only)
 - `lastNotifiedAt` — when we last sent a reset alert (cooldown anchor)
+
+A top-level `_error` key (not a provider) tracks the error-alert cooldown:
+`{"lastNotifiedAt": "<iso timestamp>"}`. On any run failure (e.g. `codexbar`
+timing out), an alert fires only if `ERROR_COOLDOWN_HOURS` (default 1) has
+elapsed since the last one — this stops a persistent failure, hit every run
+by a scheduled monitor run, from spamming an alert each time.
+The marker is cleared as soon as a run succeeds again.

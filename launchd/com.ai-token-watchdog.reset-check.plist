@@ -2,6 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- Legacy only: reset polling is disabled because frequent CodexBar calls
+         can trigger macOS Keychain password prompts. install.sh removes any
+         previously installed copy and never installs this plist. -->
     <key>Label</key>
     <string>com.ai-token-watchdog.reset-check</string>
 
@@ -31,6 +34,8 @@
 
     <!-- Run at load to establish initial state baseline -->
     <key>RunAtLoad</key>
+    <true/>
+    <key>Disabled</key>
     <true/>
 </dict>
 </plist>

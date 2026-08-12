@@ -17,8 +17,8 @@ WATCHDOG_PATH="$PROJECT_DIR/watchdog.py"
 PLISTS=(
     "com.ai-token-watchdog.monitor.plist"
     "com.ai-token-watchdog.daily.plist"
-    "com.ai-token-watchdog.reset-check.plist"
 )
+LEGACY_RESET_CHECK_PLIST="com.ai-token-watchdog.reset-check.plist"
 
 if [[ -z "$UV_PATH" ]]; then
     echo "ERROR: uv not found. Install it: https://docs.astral.sh/uv/getting-started/installation/"
@@ -76,6 +76,17 @@ MONITOR_HOURS_XML="$(build_monitor_hours_xml "$MONITOR_HOURS")"
 
 mkdir -p "$PROJECT_DIR/logs"
 
+# Legacy reset polling ran `codexbar usage` every 10 minutes. Remove a prior
+# installation so it cannot keep prompting for Keychain access in the background.
+remove_legacy_reset_check() {
+    local target="$LAUNCHD_DIR/$LEGACY_RESET_CHECK_PLIST"
+    if [[ -f "$target" ]]; then
+        launchctl unload "$target" 2>/dev/null || true
+        rm "$target"
+        echo "Unloaded and removed legacy: $LEGACY_RESET_CHECK_PLIST"
+    fi
+}
+
 if [[ "${1:-}" == "--uninstall" ]]; then
     for plist in "${PLISTS[@]}"; do
         target="$LAUNCHD_DIR/$plist"
@@ -85,9 +96,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
             echo "Unloaded and removed: $plist"
         fi
     done
+    remove_legacy_reset_check
     echo "Done. Agents uninstalled."
     exit 0
 fi
+
+remove_legacy_reset_check
 
 for plist in "${PLISTS[@]}"; do
     src="$PROJECT_DIR/launchd/$plist"
@@ -105,8 +119,6 @@ d
 }" \
         -e "s|__DAILY_REPORT_HOUR__|$DAILY_REPORT_HOUR|g" \
         "$src" > "$target" <<< "$MONITOR_HOURS_XML"
-    # reset-check plist has no placeholders beyond the common ones — sed above handles it
-
     launchctl load "$target"
     echo "Loaded: $plist"
 done
@@ -115,7 +127,6 @@ echo ""
 echo "Agents installed successfully."
 echo "  Monitor runs at local hours: ${MONITOR_HOURS}."
 echo "  Daily report runs at ${DAILY_REPORT_HOUR}:00."
-echo "  Reset-check runs every 30 min (state saved to logs/reset_state.json)."
 echo ""
 echo "Verify:  launchctl list | grep watchdog"
 echo "Logs in: $PROJECT_DIR/logs/"
