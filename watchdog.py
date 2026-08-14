@@ -746,7 +746,17 @@ def main() -> None:
     ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        data = get_usage_data()
+        data = None
+        delays = [60, 300]  # retry once after 1 min, then once more after 5 min
+        for i, delay in enumerate([0] + delays):
+            if delay:
+                time.sleep(delay)
+            try:
+                data = get_usage_data()
+                break
+            except subprocess.TimeoutExpired:
+                if i == len(delays):
+                    raise
         clear_error_cooldown()
         enabled = get_enabled_providers()
         if not enabled:
