@@ -22,6 +22,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 CODEXBAR = os.getenv("CODEXBAR_PATH", "/opt/homebrew/bin/codexbar")
+# Mirrored locally by the separate com.ai-token-watchdog.codexbar-snapshot
+# LaunchAgent (launchd/com.ai-token-watchdog.codexbar-snapshot.plist), which is
+# the only job that touches CodexBar's App-Group-protected widget-snapshot.json
+# — see docs/codexbar-keychain.md for why that read can't happen inside this
+# process (uv/venv-python break the Full Disk Access grant it needs).
+SNAPSHOT_MIRROR = Path(os.path.dirname(os.path.abspath(__file__))) / "logs" / "codexbar-snapshot.json"
+SNAPSHOT_MAX_AGE_MINUTES = int(os.getenv("CODEXBAR_SNAPSHOT_MAX_AGE_MINUTES", "30"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
@@ -93,65 +100,63 @@ def log_codexbar_call(duration_ms: int, returncode: int, providers: dict, call_e
         print(f"Warning: could not write codexbar-calls.jsonl: {e}", file=sys.stderr)
 
 
-def _refetch_claude_via_web(data: list[dict]) -> list[dict]:
-    """Re-fetch the 'claude' entry via `--source web`, which reads claude.ai
-    directly through a cookie cache independent of CodexBar's internal OAuth
-    Keychain cache (com.steipete.codexbar.cache/oauth.claude). That cache has
-    a known upstream bug where it goes stale independently of the live
-    "Claude Code-credentials" item — see docs/codexbar-keychain.md — and
-    "auto" source selection keeps picking it anyway. Falls back to the
-    original (oauth-sourced) entry if the web fetch itself fails or errors,
-    so a genuine outage still surfaces rather than being silently hidden.
-    """
-    try:
-        result = subprocess.run(
-            [CODEXBAR, "usage", "--provider", "claude", "--source", "web", "--format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        web_data = json.loads(result.stdout.strip() or "[]")
-        claude_entry = next((p for p in web_data if p.get("provider") == "claude"), None)
-    except Exception:
-        return data
-
-    if claude_entry is None or claude_entry.get("error"):
-        return data
-
-    return [claude_entry if p.get("provider") == "claude" else p for p in data]
+def _snapshot_entry_to_provider(entry: dict) -> dict:
+    """Adapt one widget-snapshot.json entry into the same per-provider shape
+    `codexbar usage --format json` used to produce, so build_*_message() and
+    detect_resets()/detect_auth_errors() don't need to change."""
+    usage: dict = {"primary": entry.get("primary") or {}, "secondary": entry.get("secondary") or {}}
+    if entry.get("tertiary"):
+        usage["tertiary"] = entry["tertiary"]
+    return {"provider": entry.get("provider"), "usage": usage}
 
 
 def get_usage_data() -> list[dict]:
+    """Read the local mirror of CodexBar's widget-snapshot.json — kept fresh by
+    the separate com.ai-token-watchdog.codexbar-snapshot LaunchAgent — instead
+    of shelling out to `codexbar usage`. This never triggers a Keychain/OAuth
+    prompt: it's a plain file read of a file this process already has normal
+    permission to read. See docs/codexbar-keychain.md.
+    """
     start = time.monotonic()
-    result = subprocess.run(
-        [CODEXBAR, "usage", "--format", "json"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    stdout = result.stdout.strip()
-    if stdout:
-        data = json.loads(stdout)
-        if find_provider(data, "claude") is not None:
-            data = _refetch_claude_via_web(data)
+    try:
+        with SNAPSHOT_MIRROR.open() as f:
+            snapshot = json.load(f)
+    except FileNotFoundError:
+        log_codexbar_call(0, 1, {}, call_error="mirror file missing")
+        raise RuntimeError(
+            f"{SNAPSHOT_MIRROR} not found — is the com.ai-token-watchdog.codexbar-snapshot "
+            "LaunchAgent installed and has CodexBar written a snapshot yet?"
+        )
+    except json.JSONDecodeError as e:
+        log_codexbar_call(0, 1, {}, call_error=f"mirror file invalid JSON: {e}")
+        raise RuntimeError(f"{SNAPSHOT_MIRROR} is not valid JSON (mid-write?): {e}")
 
-        duration_ms = round((time.monotonic() - start) * 1000)
-        providers = {}
-        for p in data:
-            name = p.get("provider", "unknown")
-            err = p.get("error")
-            providers[name] = (
-                {"status": "error", "message": err.get("message"), "code": err.get("code")}
-                if err
-                else {"status": "ok"}
-            )
-        log_codexbar_call(duration_ms, result.returncode, providers)
-        return data
+    generated_at = _parse_dt(snapshot.get("generatedAt"))
+    if generated_at is None:
+        log_codexbar_call(0, 0, {}, call_error="snapshot missing generatedAt")
+        raise RuntimeError("widget-snapshot.json has no generatedAt — is CodexBar running?")
+
+    age_minutes = (datetime.now(timezone.utc) - generated_at).total_seconds() / 60
+    if age_minutes > SNAPSHOT_MAX_AGE_MINUTES:
+        log_codexbar_call(0, 0, {}, call_error=f"snapshot stale ({age_minutes:.0f}m)")
+        raise RuntimeError(
+            f"widget-snapshot.json is {age_minutes:.0f}m old (max {SNAPSHOT_MAX_AGE_MINUTES}m) — "
+            "is CodexBar running and refreshing?"
+        )
+
+    entries = snapshot.get("entries", [])
+    data = [_snapshot_entry_to_provider(e) for e in entries]
+
+    # A provider CodexBar has enabled but that's missing from this snapshot is
+    # treated as an auth/fetch error, so detect_auth_errors() still alerts.
+    present = {p["provider"] for p in data}
+    for name in set(snapshot.get("enabledProviders", [])) - present:
+        data.append({"provider": name, "usage": {}, "error": {"message": "missing from CodexBar snapshot"}})
 
     duration_ms = round((time.monotonic() - start) * 1000)
-    detail = result.stderr.strip() or "no stdout or stderr output"
-    log_codexbar_call(duration_ms, result.returncode, {}, call_error=detail)
-    raise RuntimeError(f"codexbar exited {result.returncode}: {detail}")
+    providers = {p["provider"]: {"status": "error"} if p.get("error") else {"status": "ok"} for p in data}
+    log_codexbar_call(duration_ms, 0, providers)
+    return data
 
 
 def find_provider(data: list[dict], name: str) -> dict | None:
@@ -754,7 +759,7 @@ def main() -> None:
             try:
                 data = get_usage_data()
                 break
-            except subprocess.TimeoutExpired:
+            except RuntimeError:
                 if i == len(delays):
                     raise
         clear_error_cooldown()
@@ -763,8 +768,6 @@ def main() -> None:
             print("WARNING: No providers enabled. Set PROVIDER_*_ENABLED=true in .env", file=sys.stderr)
 
         message = build_daily_message(data, enabled) if daily else build_monitor_message(data, enabled)
-    except FileNotFoundError:
-        message = f"🚨 *AI Token Watchdog ERROR*\ncodexbar not found at `{CODEXBAR}`"
     except Exception as e:
         message = f"🚨 *AI Token Watchdog ERROR*\n`{type(e).__name__}: {e}`"
     else:

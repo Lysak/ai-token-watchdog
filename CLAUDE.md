@@ -32,6 +32,19 @@ After a detected reset, `maxUsedPercent` resets to 0 for the next cycle.
 **Do NOT use `resetsAt` changes to detect Claude resets** — the value can jitter
 by 1–2 seconds between API calls and produce false positives.
 
+## CodexBar data source
+
+`get_usage_data()` reads `logs/codexbar-snapshot.json` (a local mirror of
+CodexBar's own widget-snapshot, kept fresh by the
+`com.ai-token-watchdog.codexbar-snapshot` LaunchAgent) — **not**
+`codexbar usage`. See `docs/codexbar-snapshot-mirror.md` for the architecture
+and an important diagnostic finding: `uv`/uv-managed Python are ad hoc-signed
+and break a Full Disk Access grant scoped to a child binary, so the helper
+that touches the protected source file must run as its own LaunchAgent, never
+as a subprocess of `uv run watchdog.py`. Rebuilding
+`tools/read-codexbar-snapshot` also requires re-granting Full Disk Access
+**and** `sudo killall tccd` — see that doc before touching this binary.
+
 ## State file (`logs/reset_state.json`)
 
 Fields per provider:

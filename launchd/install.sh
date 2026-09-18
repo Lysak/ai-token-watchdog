@@ -14,9 +14,15 @@ ENV_FILE="$PROJECT_DIR/.env"
 UV_PATH="$(which uv 2>/dev/null || echo "")"
 WATCHDOG_PATH="$PROJECT_DIR/watchdog.py"
 
+READER_PATH="$PROJECT_DIR/tools/read-codexbar-snapshot"
+READER_SRC="$PROJECT_DIR/tools/read-codexbar-snapshot.c"
+SNAPSHOT_SOURCE="$HOME/Library/Group Containers/Y5PE65HELJ.com.steipete.codexbar/widget-snapshot.json"
+SNAPSHOT_DEST="$PROJECT_DIR/logs/codexbar-snapshot.json"
+
 PLISTS=(
     "com.ai-token-watchdog.monitor.plist"
     "com.ai-token-watchdog.daily.plist"
+    "com.ai-token-watchdog.codexbar-snapshot.plist"
 )
 LEGACY_RESET_CHECK_PLIST="com.ai-token-watchdog.reset-check.plist"
 
@@ -103,6 +109,23 @@ fi
 
 remove_legacy_reset_check
 
+# read-codexbar-snapshot mirrors CodexBar's App-Group-protected
+# widget-snapshot.json into $SNAPSHOT_DEST — see docs/codexbar-keychain.md.
+# Only compile it if missing: recompiling an existing binary changes its ad
+# hoc code signature and invalidates any Full Disk Access grant already made
+# for it in System Settings.
+if [[ ! -x "$READER_PATH" ]]; then
+    echo "Compiling read-codexbar-snapshot..."
+    xcrun clang -O2 -o "$READER_PATH" "$READER_SRC"
+    echo "⚠️  New binary — grant it Full Disk Access:"
+    echo "    System Settings → Privacy & Security → Full Disk Access → + → $READER_PATH"
+elif [[ "$READER_SRC" -nt "$READER_PATH" ]]; then
+    echo "⚠️  $READER_SRC changed since the last build — NOT auto-recompiling"
+    echo "    (would invalidate the existing Full Disk Access grant)."
+    echo "    Rebuild manually, then remove + re-add it in Full Disk Access:"
+    echo "    xcrun clang -O2 -o \"$READER_PATH\" \"$READER_SRC\""
+fi
+
 for plist in "${PLISTS[@]}"; do
     src="$PROJECT_DIR/launchd/$plist"
     target="$LAUNCHD_DIR/$plist"
@@ -113,6 +136,9 @@ for plist in "${PLISTS[@]}"; do
         -e "s|__UV_PATH__|$UV_PATH|g" \
         -e "s|__WATCHDOG_PATH__|$WATCHDOG_PATH|g" \
         -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
+        -e "s|__READER_PATH__|$READER_PATH|g" \
+        -e "s|__SNAPSHOT_SOURCE__|$SNAPSHOT_SOURCE|g" \
+        -e "s|__SNAPSHOT_DEST__|$SNAPSHOT_DEST|g" \
         -e "/__MONITOR_HOURS_XML__/{
 r /dev/stdin
 d
@@ -127,6 +153,7 @@ echo ""
 echo "Agents installed successfully."
 echo "  Monitor runs at local hours: ${MONITOR_HOURS}."
 echo "  Daily report runs at ${DAILY_REPORT_HOUR}:00."
+echo "  CodexBar snapshot mirror runs on load + whenever CodexBar updates its snapshot."
 echo ""
 echo "Verify:  launchctl list | grep watchdog"
 echo "Logs in: $PROJECT_DIR/logs/"

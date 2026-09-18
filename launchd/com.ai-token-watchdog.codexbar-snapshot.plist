@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Mirrors CodexBar's App-Group-protected widget-snapshot.json into a plain
+         project file watchdog.py can read with no special permissions. This is
+         the only job that touches the protected source path, and it must run
+         as a direct child of launchd (not via `uv run`/venv-python — both are ad
+         hoc-signed and, empirically, break the Full Disk Access grant scoped to
+         __READER_PATH__; see docs/codexbar-keychain.md). -->
+    <key>Label</key>
+    <string>com.ai-token-watchdog.codexbar-snapshot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__READER_PATH__</string>
+        <string>__SNAPSHOT_SOURCE__</string>
+        <string>__SNAPSHOT_DEST__</string>
+    </array>
+
+    <!-- Re-mirror whenever CodexBar itself writes a fresh snapshot. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>__SNAPSHOT_SOURCE__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/codexbar-snapshot-mirror.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/codexbar-snapshot-mirror.error.log</string>
+</dict>
+</plist>

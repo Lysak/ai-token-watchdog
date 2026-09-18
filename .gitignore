@@ -5,4 +5,5 @@
 __pycache__/
 *.pyc
 logs/
+tools/read-codexbar-snapshot
 ai_token_watchdog.egg-info
